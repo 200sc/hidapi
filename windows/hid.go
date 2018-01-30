@@ -2,7 +2,10 @@ package hid
 
 import (
 	"math"
+	"strconv"
+	"strings"
 	"syscall"
+	"unsafe"
 
 	"github.com/oakmound/w32"
 )
@@ -68,9 +71,6 @@ type HIDP_CAPS struct {
 	fields_not_used_by_hidapi [10]uint16
 }
 type PHIDP_PREPARSED_DATA interface{}
-
-var lib_handle HMODULE
-var initialized bool
 
 type hid_device struct {
 	device_handle        w32.HANDLE
@@ -144,14 +144,14 @@ func free_hid_device(dev *hid_device) {
 }
 
 func register_error(device *hid_device, op string) {
-	FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER|
-		FORMAT_MESSAGE_FROM_SYSTEM|
-		FORMAT_MESSAGE_IGNORE_INSERTS,
-		nil,
+	var msg string
+	w32.FormatMessage(w32.FORMAT_MESSAGE_ALLOCATE_BUFFER|
+		w32.FORMAT_MESSAGE_FROM_SYSTEM|
+		w32.FORMAT_MESSAGE_IGNORE_INSERTS,
+		0,
 		w32.GetLastError(),
-		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-		(LPVOID)&msg, 0, /*sz*/
-		nil)
+		0,
+		msg, 0)
 
 	/* Store the message off in the Device entry so that
 	   the hid_error() function can pick it up. */
@@ -159,42 +159,21 @@ func register_error(device *hid_device, op string) {
 }
 
 func open_device(path string, enumerate bool) w32.HANDLE {
-	var desired_access uint32
+	var desiredAccess uint32
 	if !enumerate {
-		desired_access = (GENERIC_WRITE | GENERIC_READ)
+		desiredAccess = (w32.GENERIC_WRITE | w32.GENERIC_READ)
 	}
+	var shareMode uint32 = w32.FILE_SHARE_READ | w32.FILE_SHARE_WRITE
 
-	share_mode := FILE_SHARE_READ | FILE_SHARE_WRITE
-
-	handle := CreateFileA(path,
-		desired_access,
-		share_mode,
+	handle := w32.CreateFile(path,
+		desiredAccess,
+		shareMode,
 		nil,
-		OPEN_EXISTING,
-		FILE_FLAG_OVERLAPPED, /*FILE_ATTRIBUTE_NORMAL,*/
+		w32.OPEN_EXISTING,
+		w32.FILE_FLAG_OVERLAPPED, /*FILE_ATTRIBUTE_NORMAL,*/
 		0)
 
 	return handle
-}
-
-func hid_init() int {
-	if !initialized {
-		if lookup_functions() < 0 {
-			hid_exit()
-			return -1
-		}
-		initialized = true
-	}
-	return 0
-}
-
-func hid_exit() int {
-	if lib_handle != nil {
-		lib_handle.Release()
-	}
-	lib_handle = nil
-	initialized = false
-	return 0
 }
 
 func hid_enumerate(vendor_id, product_id uint16) []hid_device_info {
@@ -204,34 +183,32 @@ func hid_enumerate(vendor_id, product_id uint16) []hid_device_info {
 
 	/* Windows objects for interacting with the driver. */
 
-	InterfaceClassGuid := GUID{0x4d1e55b2, 0xf16f, 0x11cf, {0x88, 0xcb, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30}}
-	var devinfo_data SP_DEVINFO_DATA
-	var device_interface_data SP_DEVICE_INTERFACE_DATA
-	var device_interface_detail_data *SP_DEVICE_INTERFACE_DETAIL_DATA_A
-	var device_info_set HDEVINFO = InvalidHandle
-	device_index := 0
+	InterfaceClassGuid := w32.GUID{0x4d1e55b2, 0xf16f, 0x11cf, [8]byte{0x88, 0xcb, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30}}
+	var devinfo_data w32.SP_DEVINFO_DATA
+	var device_interface_data w32.SP_DEVICE_INTERFACE_DATA
+	var device_interface_detail_data *w32.SP_DEVICE_INTERFACE_DETAIL_DATA
+	var device_index uint32
 	i := 0
 
-	if hid_init() < 0 {
-		return nil
-	}
-
 	/* Initialize the Windows objects. */
-	memset(&devinfo_data, 0x0, sizeof(devinfo_data))
-	devinfo_data.cbSize = sizeof(SP_DEVINFO_DATA)
-	device_interface_data.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA)
+	devinfo_data.CbSize = 28          //sizeof(SP_DEVINFO_DATA)
+	device_interface_data.CbSize = 28 //sizeof(SP_DEVICE_INTERFACE_DATA)
 
 	/* Get information for all the devices belonging to the HID class. */
-	device_info_set = SetupDiGetClassDevsA(&InterfaceClassGuid, nil, nil, DIGCF_PRESENT|DIGCF_DEVICEINTERFACE)
+	device_info_set, err := w32.SetupDiGetClassDevsEx(InterfaceClassGuid, "", 0, w32.DIGCF_PRESENT|w32.DIGCF_DEVICEINTERFACE, 0, "", 0)
+	if err != nil {
+		// todo: don't panic
+		panic(err)
+	}
 
 	/* Iterate over each device in the HID class, looking for the right one. */
 
 	for {
 		var write_handle w32.HANDLE = InvalidHandle
-		required_size := 0
+		var required_size uint32
 		var attrib HIDD_ATTRIBUTES
 
-		res = SetupDiEnumDeviceInterfaces(device_info_set,
+		res = w32.SetupDiEnumDeviceInterfaces(device_info_set,
 			nil,
 			&InterfaceClassGuid,
 			device_index,
@@ -246,7 +223,7 @@ func hid_enumerate(vendor_id, product_id uint16) []hid_device_info {
 		/* Call with 0-sized detail size, and let the function
 		   tell us how long the detail struct needs to be. The
 		   size is put in &required_size. */
-		res = SetupDiGetDeviceInterfaceDetailA(device_info_set,
+		res = w32.SetupDiGetDeviceInterfaceDetail(device_info_set,
 			&device_interface_data,
 			nil,
 			0,
@@ -254,13 +231,13 @@ func hid_enumerate(vendor_id, product_id uint16) []hid_device_info {
 			nil)
 
 		/* Allocate a long enough structure for device_interface_detail_data. */
-		device_interface_detail_data = &SP_DEVICE_INTERFACE_DETAIL_DATA_A{}
-		device_interface_detail_data.cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A)
+		device_interface_detail_data = &w32.SP_DEVICE_INTERFACE_DETAIL_DATA{}
+		device_interface_detail_data.CbSize = uint32(required_size)
 
 		/* Get the detailed data for this device. The detail data gives us
 		   the device path for this device, which is then passed into
 		   CreateFile() to get a handle to the device. */
-		res = SetupDiGetDeviceInterfaceDetailA(device_info_set,
+		res = w32.SetupDiGetDeviceInterfaceDetail(device_info_set,
 			&device_interface_data,
 			device_interface_detail_data,
 			required_size,
@@ -275,27 +252,25 @@ func hid_enumerate(vendor_id, product_id uint16) []hid_device_info {
 
 		/* Make sure this device is of Setup Class "HIDClass" and has a
 		   driver bound to it. */
-		i == 0
+		i = 0
 		for {
-			var driver_name string
+			driver_name := make([]byte, 256)
 
 			/* Populate devinfo_data. This function will return failure
 			   when there are no more interfaces left. */
-			res = SetupDiEnumDeviceInfo(device_info_set, i, &devinfo_data)
+			devinfo_data, err := w32.SetupDiEnumDeviceInfo(device_info_set, uint32(i))
+			if err != nil {
+				goto cont
+			}
+
+			res = w32.SetupDiGetDeviceRegistryProperty(device_info_set, devinfo_data, w32.SPDRP_CLASS, nil, driver_name, 256, nil)
 			if !res {
 				goto cont
 			}
 
-			res = SetupDiGetDeviceRegistryPropertyA(device_info_set, &devinfo_data,
-				SPDRP_CLASS, nil, driver_name, 256, nil)
-			if !res {
-				goto cont
-			}
-
-			if strcmp(driver_name, "HIDClass") == 0 {
+			if string(driver_name[0:8]) == "HIDClass" {
 				/* See if there's a driver bound. */
-				res = SetupDiGetDeviceRegistryPropertyA(device_info_set, &devinfo_data,
-					SPDRP_DRIVER, nil, driver_name, 256, nil)
+				res = w32.SetupDiGetDeviceRegistryProperty(device_info_set, devinfo_data, w32.SPDRP_DRIVER, nil, driver_name, 256, nil)
 				if res {
 					break
 				}
@@ -316,8 +291,8 @@ func hid_enumerate(vendor_id, product_id uint16) []hid_device_info {
 		}
 
 		/* Get the Vendor ID and Product ID for this device. */
-		attrib.Size = sizeof(HIDD_ATTRIBUTES)
-		HidD_GetAttributes(write_handle, &attrib)
+		attrib.Size = 10
+		w32.HidD_GetAttributes(write_handle, &attrib)
 		//wprintf(L"Product/Vendor: %x %x\n", attrib.ProductID, attrib.VendorID)
 
 		/* Check the VID/PID to see if we should add this
@@ -327,62 +302,57 @@ func hid_enumerate(vendor_id, product_id uint16) []hid_device_info {
 
 			str := ""
 			var tmp *hid_device_info
-			var pp_data *HIDP_PREPARSED_DATA
+			var pp_data *w32.HIDP_PREPARSED_DATA
 			var caps HIDP_CAPS
 
-			var nt_res NTSTATUS
+			var nt_res w32.NTSTATUS
 			var wstr [512]rune /* TODO: Determine Size */
 			var ln int
 
 			/* VID/PID match. Create the record. */
 			tmp = &hid_device_info{}
-			if cur_dev != nil {
-				cur_dev.next = tmp
-			} else {
-				root = append(root, tmp)
-			}
+			root = append(root, *tmp)
 			cur_dev = tmp
 
 			/* Get the Usage Page and Usage for this device. */
-			res = HidD_GetPreparsedData(write_handle, &pp_data)
+			res = w32.HidD_GetPreparsedData(write_handle, &pp_data)
 			if res {
-				nt_res = HidP_GetCaps(pp_data, &caps)
+				nt_res = w32.HidP_GetCaps(pp_data, &caps)
 				if nt_res == HIDP_STATUS_SUCCESS {
-					cur_dev.usage_page = caps.UsagePage
-					cur_dev.usage = caps.Usage
+					cur_dev.usage_page = uint16(caps.UsagePage)
+					cur_dev.usage = uint16(caps.Usage)
 				}
 
-				HidD_FreePreparsedData(pp_data)
+				w32.HidD_FreePreparsedData(pp_data)
 			}
 
 			/* Fill out the record */
-			cur_dev.next = nil
 			str = device_interface_detail_data.DevicePath
-			if str {
-				cur_dev.path = str[:] + '\000'
+			if str != "" {
+				cur_dev.path = str[:] + string('\000')
 			} else {
 				cur_dev.path = ""
 			}
 
 			/* Serial Number */
-			res = HidD_GetSerialNumberString(write_handle, wstr, sizeof(wstr))
+			res = w32.HidD_GetSerialNumberString(write_handle, wstr, unsafe.Sizeof(wstr))
 			wstr[512-1] = 0x0000
 			if res {
-				cur_dev.serial_number = _wcsdup(wstr)
+				cur_dev.serial_number = string(wstr[:])
 			}
 
 			/* Manufacturer String */
-			res = HidD_GetManufacturerString(write_handle, wstr, sizeof(wstr))
+			res = w32.HidD_GetManufacturerString(write_handle, wstr, unsafe.Sizeof(wstr))
 			wstr[512-1] = 0x0000
 			if res {
-				cur_dev.manufacturer_string = _wcsdup(wstr)
+				cur_dev.manufacturer_string = string(wstr[:])
 			}
 
 			/* Product String */
-			res = HidD_GetProductString(write_handle, wstr, sizeof(wstr))
+			res = HidD_GetProductString(write_handle, wstr, unsafe.Sizeof(wstr))
 			wstr[512-1] = 0x0000
 			if res {
-				cur_dev.product_string = _wcsdup(wstr)
+				cur_dev.product_string = string(wstr[:])
 			}
 
 			/* VID/PID */
@@ -398,13 +368,12 @@ func hid_enumerate(vendor_id, product_id uint16) []hid_device_info {
 			   search for "Hardware IDs for HID Devices" at MSDN. If it's not
 			   in the path, it's set to -1. */
 			cur_dev.interface_number = -1
-			if cur_dev.path {
-				char * interface_component = strstr(cur_dev.path, "&mi_")
-				if interface_component {
-					char * hex_str = interface_component + 4
-					char * endptr = nil
-					cur_dev.interface_number = strtol(hex_str, &endptr, 16)
-					if endptr == hex_str {
+			if cur_dev.path != "" {
+				interface_component := strings.Index(cur_dev.path, "&mi_")
+				if interface_component != -1 {
+					hex_str := interface_component + 4
+					cur_dev.interface_number, err = strconv.Atoi(cur_dev.path[hex_str:])
+					if err != nil {
 						/* The parsing failed. Set interface_number to -1. */
 						cur_dev.interface_number = -1
 					}
@@ -413,17 +382,14 @@ func hid_enumerate(vendor_id, product_id uint16) []hid_device_info {
 		}
 
 	cont_close:
-		CloseHandle(write_handle)
+		w32.CloseHandle(write_handle)
 	cont:
 		/* We no longer need the detail data. It can be freed */
-		free(device_interface_detail_data)
-
 		device_index++
-
 	}
 
 	/* Close the device information handle. */
-	SetupDiDestroyDeviceInfoList(device_info_set)
+	w32.SetupDiDestroyDeviceInfoList(device_info_set)
 
 	return root
 
@@ -464,10 +430,6 @@ func hid_open_path(path string) *hid_device {
 	var pp_data PHIDP_PREPARSED_DATA
 	var res bool
 	var nt_res NTSTATUS
-
-	if hid_init() < 0 {
-		return nil
-	}
 
 	dev = new_hid_device()
 
